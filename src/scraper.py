@@ -1,51 +1,58 @@
+import os, zipfile, json, time
+from datetime import datetime
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
-def run_scraper(url: str):
-    """
-    Uses Playwright to navigate and BeautifulSoup to parse.
-    """
+AUTH_FILE = "outputs/auth.json"
+
+def scrape_amazon_node(state):
+    """Scrapes Amazon. Shows window for OTP if needed."""
+    search_query = state["query"]
+    results = []
+    os.makedirs("outputs", exist_ok=True)
+    
     with sync_playwright() as p:
-        # 1. ADD USER-AGENT: This tells the website you are a real Chrome browser, not a bot.
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-        
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled", # Hides the automation flag
-                "--no-sandbox"
-            ]
-        )
-        # Create a context with the user agent
-        context = browser.new_context(user_agent=user_agent)
+        # Visible browser to allow manual OTP entry
+        browser = p.chromium.launch(headless=False, args=["--no-sandbox"]) 
+        context = browser.new_context(storage_state=AUTH_FILE) if os.path.exists(AUTH_FILE) else browser.new_context()
         page = context.new_page()
 
-        print(f"Opening browser to: {url}")
+        page.goto("https://www.amazon.in")
         try:
-            # Navigate with a generous timeout for heavy pages
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            
-            # 2. WAIT FOR CONTENT: Instead of just 'body', wait for article-related tags
-            page.wait_for_selector("p", timeout=10000) 
-            
-            html = page.content()
-            soup = BeautifulSoup(html, "html.parser")
-            
-            # 3. EXTRACTION LOGIC: Actually find and clean the text
-            # We look for all paragraph tags and join them into one string
-            paragraphs = soup.find_all('p') # Web-element
-            text_content = " ".join([p.get_text() for p in paragraphs])
-            
-            # Basic check: if we got very little text, we might be blocked
-            if len(text_content) < 100:
-                print("Warning: Very little text found. The site might be blocking us.")
-                return "Error: Content could not be extracted (possibly blocked)."
+            if not os.path.exists(AUTH_FILE):
+                print("⚠️ PLEASE LOGIN & SUBMIT OTP ON SCREEN...")
+                page.wait_for_selector("#twotabsearchtextbox", timeout=120000)
+                context.storage_state(path=AUTH_FILE)
 
-            # Return the first 2000 characters so we don't exceed AI token limits
-            return text_content[:2000]
+            page.fill("#twotabsearchtextbox", search_query)
+            page.press("#twotabsearchtextbox", "Enter")
+            page.wait_for_selector("[data-component-type='s-search-result']")
 
+            for i in range(1, 3): # Scrape 2 pages
+                soup = BeautifulSoup(page.content(), "html.parser")
+                for item in soup.find_all("div", {"data-component-type": "s-search-result"}):
+                    name = item.find("h2").text.strip() if item.find("h2") else "N/A"
+                    price = item.find("span", {"class": "a-price-whole"}).text.strip() if item.find("span", {"class": "a-price-whole"}) else "N/A"
+                    if name != "N/A": results.append({"name": name, "price": price})
+                
+                next_btn = page.query_selector("a.s-pagination-next")
+                if next_btn: next_btn.click(); time.sleep(2)
+                else: break
         except Exception as e:
-            print(f"Scraping failed: {e}")
-            return "Error: Could not load page"
+            print(f"❌ Error: {e}")
         finally:
             browser.close()
+    return {"raw_data": results, "filtered_data": results}
+
+def zip_exporter_node(state):
+    """Saves ONLY the filtered data to the outputs folder."""
+    os.makedirs("outputs", exist_ok=True)
+    timestamp = datetime.now().strftime("%H%M%S")
+    zip_path = os.path.join("outputs", f"amazon_data_{timestamp}.zip")
+    json_path = zip_path.replace(".zip", ".json")
+
+    data = state.get("filtered_data", state["raw_data"])
+    with open(json_path, "w") as f: json.dump(data, f, indent=4)
+    with zipfile.ZipFile(zip_path, 'w') as zf: zf.write(json_path, arcname="data.json")
+    os.remove(json_path)
+    return {"answer": f"📦 ZIP created: {zip_path}"}
